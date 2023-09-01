@@ -1,0 +1,4 @@
+pytest
+Sphinx
+twine
+rst2pdf
