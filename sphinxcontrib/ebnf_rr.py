@@ -211,10 +211,11 @@ _ARGS_BY_FILEFORMAT = {
 }
 
 
-def generate_rr_args(self, node, fileformat):
+def generate_rr_args(self, node, fileformat, outfname=None):
     args = _split_cmdargs(self.builder.config.ebnf)
-    args.extend(['-pipe', '-charset', 'utf-8'])
     args.extend(_ARGS_BY_FILEFORMAT[fileformat])
+    if outfname is not None:
+        args.extend('-out:' + outfname)
     args.extend([node['filename']])
     return args
 
@@ -253,19 +254,17 @@ def render_ebnf_inline(self, node, fileformat):
     return sout.decode('utf-8')
 
 
-class RrBuilder(object):
+class EbnfBuilder(object):
     def __init__(self, builder):
         # for compatibility with existing functions which expect self.builder
         # TODO: remove self.builder
         self.builder = builder
 
-        self.batch_size = builder.config.ebnf_batch_size
         self.cache_dir = os.path.join(
             builder.outdir, builder.config.ebnf_cache_path
         )
 
         self._base_cmdargs = _split_cmdargs(builder.config.ebnf)
-        self._base_cmdargs.extend(['-charset', 'utf-8'])
 
         self.image_formats = []
         if builder.format == 'html':
@@ -273,74 +272,9 @@ class RrBuilder(object):
             if fmt != 'none':
                 fileformats, _gettag = _lookup_html_format(fmt)
                 self.image_formats = list(fileformats)
-        elif builder.format == 'xhtml':
-            fmt = builder.config.ebnf_xhtml_output_format
-            if fmt != 'none':
-                fileformat, _postproc = _lookup_latex_format(fmt)
-                self.image_formats = [fileformat]
 
         self._known_keys = set()
         self._pending_keys = []
-
-    def collect_nodes(self, doctree):
-        for node in doctree.traverse(ebnf):
-            key = hash_ebnf_node(node)
-            if key in self._known_keys:
-                continue
-            self._known_keys.add(key)
-
-            doc = node['ebnf'].encode('utf-8')
-            if b'!include' in doc or b'%filename' in doc:
-                # Heuristic to work around the path/filename issue. There's no
-                # easy way to specify the cwd of the doc without using -pipe.
-                continue
-
-            outdir = os.path.join(self.cache_dir, key[:2])
-            outfbase = os.path.join(outdir, key)
-            if all(
-                os.path.exists('%s.%s' % (outfbase, sfx))
-                for sfx in ['ebnf'] + self.image_formats
-            ):
-                continue
-
-            ensuredir(outdir)
-            with open(outfbase + '.ebnf', 'wb') as f:
-                f.write(doc)
-            self._pending_keys.append(key)
-
-    def render_batches(self):
-        pending_keys = sorted(self._pending_keys)
-        for fileformat in self.image_formats:
-            for i in range(0, len(pending_keys), self.batch_size):
-                keys = pending_keys[i : i + self.batch_size]
-                with util.progress_message(
-                    'rendering railroad diagrams [%d..%d/%d]'
-                    % (i, i + len(keys), len(pending_keys))
-                ):
-                    self._render_files(keys, fileformat)
-
-        del self._pending_keys[:]
-
-    def _render_files(self, keys, fileformat):
-        cmdargs = self._base_cmdargs[:]
-        cmdargs.extend(_ARGS_BY_FILEFORMAT[fileformat])
-        cmdargs.extend(os.path.join(k[:2], '%s.ebnf' % k) for k in keys)
-        try:
-            p = subprocess.Popen(cmdargs, stderr=subprocess.PIPE, cwd=self.cache_dir)
-        except OSError as err:
-            if err.errno != errno.ENOENT:
-                raise
-            raise EbnfError(
-                'rr command %r cannot be run' % self.builder.config.ebnf
-            )
-        serr = p.communicate()[1]
-        if p.returncode != 0:
-            if self.builder.config.ebnf_syntax_error_image:
-                logger.warning(
-                    'error while running rr\n\n%s' % serr, type='ebnf'
-                )
-            else:
-                raise EbnfError('error while running rr\n\n%s' % serr)
 
     def render(self, node, fileformat):
         key = hash_ebnf_node(node)
@@ -354,7 +288,7 @@ class RrBuilder(object):
         with open(outfname + '.new', 'wb') as f:
             try:
                 p = subprocess.Popen(
-                    generate_rr_args(self, node, fileformat),
+                    generate_rr_args(self, node, fileformat, outfname),
                     stdout=f,
                     stdin=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -379,10 +313,6 @@ class RrBuilder(object):
 
         rename(outfname + '.new', outfname)
         return outfname
-
-
-def _render_batches_on_vist(self):
-    self.builder.ebnf_builder.render_batches()
 
 
 def _get_png_tag(self, fnames, node):
@@ -540,7 +470,6 @@ def _prepare_html_render(self, fmt, node):
 
 
 def html_visit_ebnf(self, node):
-    _render_batches_on_vist(self)
     if 'html_format' in node:
         fmt = node['html_format']
     else:
@@ -588,7 +517,6 @@ _KNOWN_CONFLUENCE_FORMATS = [
 
 
 def confluence_visit_ebnf(self, node):
-    _render_batches_on_vist(self)
     fmt = self.builder.config.ebnf_output_format
     if fmt == 'none':
         raise nodes.SkipNode
@@ -612,7 +540,6 @@ def confluence_depart_ebnf(self, node):
 
 
 def text_visit_ebnf(self, node):
-    _render_batches_on_vist(self)
     try:
         text = render_ebnf_inline(self, node, 'txt')
     except EbnfError as err:
@@ -626,7 +553,6 @@ def text_visit_ebnf(self, node):
 
 
 def pdf_visit_ebnf(self, node):
-    _render_batches_on_vist(self)
     try:
         refname, outfname = render_ebnf(self, node, 'eps')
         refname, outfname = _convert_eps_to_pdf(self, refname, outfname)
@@ -649,8 +575,8 @@ def unsupported_visit_ebnf(self, node):
 _NODE_VISITORS = {
     'html': (html_visit_ebnf, None),
     'latex': (unsupported_visit_ebnf, None),
-    'man': (unsupported_visit_ebnf, None),  # TODO
-    'texinfo': (unsupported_visit_ebnf, None),  # TODO
+    'man': (unsupported_visit_ebnf, None),
+    'texinfo': (unsupported_visit_ebnf, None),
     'text': (text_visit_ebnf, None),
     'confluence': (confluence_visit_ebnf, confluence_depart_ebnf),
     'singleconfluence': (confluence_visit_ebnf, confluence_depart_ebnf),
@@ -658,22 +584,7 @@ _NODE_VISITORS = {
 
 
 def _on_builder_inited(app):
-    app.builder.ebnf_builder = RrBuilder(app.builder)
-
-
-def _on_doctree_read(app, doctree):
-    # Collect as many static nodes as possible prior to start building.
-    if app.builder.ebnf_builder.batch_size > 1:
-        app.builder.ebnf_builder.collect_nodes(doctree)
-
-
-def _on_doctree_resolved(app, doctree, docname):
-    # Dynamically generated nodes will be collected here, which will be
-    # batched at node visitor. Since 'doctree-resolved' and node visits
-    # can be intermixed, there's no way to batch rendering of dynamic nodes
-    # at once.
-    if app.builder.ebnf_builder.batch_size > 1:
-        app.builder.ebnf_builder.collect_nodes(doctree)
+    app.builder.ebnf_builder = EbnfBuilder(app.builder)
 
 
 def setup(app):
@@ -689,10 +600,7 @@ def setup(app):
     app.add_config_value('ebnf_latex_output_format', 'png', '')
     app.add_config_value('ebnf_syntax_error_image', False, '')
     app.add_config_value('ebnf_cache_path', '_ebnf', '')
-    app.add_config_value('ebnf_batch_size', 1, '')
     app.connect('builder-inited', _on_builder_inited)
-    app.connect('doctree-read', _on_doctree_read)
-    app.connect('doctree-resolved', _on_doctree_resolved)
 
     # imitate what app.add_node() does
     if 'rst2pdf.pdfbuilder' in app.config.extensions:
